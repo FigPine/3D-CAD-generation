@@ -1,0 +1,70 @@
+[
+  {
+    "id": "complete_prompt",
+    "description": "A fully described single-floor house — no clarification should be needed.",
+    "prompt": "Build a single-floor residential house with two bedrooms (each with two windows and one door), one bathroom (one window, one door), and one hall (no windows, one main entrance door).",
+    "expected_fields": {
+      "building_type": "residential",
+      "floor_count": 1,
+      "rooms": [
+        {"room_type": "bedroom", "count": 2, "window_count": 2, "door_count": 1},
+        {"room_type": "bathroom", "count": 1, "window_count": 1, "door_count": 1},
+        {"room_type": "hall", "count": 1, "window_count": 0, "door_count": 1}
+      ],
+      "units": null
+    },
+    "expected_clarification_rounds": 0
+  },
+  {
+    "id": "minimal_prompt",
+    "description": "A minimal prompt — agent should ask about rooms at minimum.",
+    "prompt": "Build a floor plan.",
+    "expected_fields": {
+      "building_type": null,
+      "floor_count": null,
+      "rooms": null
+    },
+    "expected_clarification_rounds": 1
+  },
+  {
+    "id": "partial_rooms_prompt",
+    "description": "Rooms mentioned but no opening counts — agent should ask or default.",
+    "prompt": "I need a residential house with 2 bedrooms, 1 bathroom, and a kitchen.",
+    "expected_fields": {
+      "building_type": "residential",
+      "floor_count": null,
+      "rooms": [
+        {"room_type": "bedroom", "count": 2},
+        {"room_type": "bathroom", "count": 1},
+        {"room_type": "kitchen", "count": 1}
+      ]
+    },
+    "expected_clarification_rounds": 1
+  },
+  {
+    "id": "relationship_prompt",
+    "description": "Includes explicit adjacency relationship.",
+    "prompt": "Build a residential house with 2 bedrooms, 1 bathroom, and a kitchen adjacent to the hall.",
+    "expected_fields": {
+      "relationships": [
+        {"room_a": "kitchen", "room_b": "hall", "relationship": "adjacent_to"}
+      ]
+    },
+    "expected_clarification_rounds": 1
+  },
+  {
+    "id": "constraint_prompt",
+    "description": "Includes an explicit constraint.",
+    "prompt": "Build a house with 3 bedrooms. The master bedroom must not share a wall with the bathroom.",
+    "expected_fields": {
+      "constraints": ["master bedroom must not share a wall with the bathroom"]
+    }
+  },
+  {
+    "id": "use_defaults_followup",
+    "description": "Simulated follow-up scenario: user says 'use defaults'.",
+    "prompt": "Residential building.",
+    "followups": ["use defaults"],
+    "note": "After 'use defaults', all eligible missing fields should be filled."
+  }
+]

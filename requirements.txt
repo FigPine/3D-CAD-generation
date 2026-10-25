@@ -1,0 +1,18 @@
+# Requirements Extraction Agent — Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# Pinned to tested versions. Update and re-test before changing major versions.
+
+# --- Core LLM SDK ---
+google-genai>=1.0.0
+
+# --- Data validation ---
+pydantic>=2.0.0
+
+# --- Testing ---
+pytest>=8.0.0
+pytest-mock>=3.12.0
+
+# --- Optional: load .env files in development ---
+python-dotenv>=1.0.0
