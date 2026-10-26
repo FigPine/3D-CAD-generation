@@ -47,8 +47,17 @@ from schemas import (
 )
 from requirements.requirement_state import RequirementState
 from requirements.completeness_checker import CompletenessChecker
-from requirements.dialogue_manager import DialogueManager
+from requirements.dialogue_manager import (
+    DEFAULTS_PREFERENCE_PROMPT,
+    DialogueManager,
+    parse_preference_reply,
+)
 from requirements.defaults import DEFAULTS
+from requirements.unit_normalizer import (
+    canonicalize_unit_name,
+    detect_unit_in_text,
+    normalize_to_metres,
+)
 from validators.requirements_validator import RequirementsValidator, ValidationError
 from llm.gemini_client import GeminiClient, LLMError, LLMAuthError
 from llm.prompts import (
@@ -102,22 +111,25 @@ def start_session(prompt: str) -> AgentTurn:
     Start a new extraction session from the initial user prompt.
 
     1. Creates a fresh ``RequirementState``.
-    2. Calls Gemini to extract initial candidate requirements.
-    3. Merges the candidate into the state.
-    4. Runs completeness check and returns the appropriate ``AgentTurn``.
-
-    Parameters
-    ----------
-    prompt : str
-        The user's free-form building description.
-
-    Returns
-    -------
-    AgentTurn
+    2. Detects explicit units in the user prompt if present.
+    3. Calls Gemini to extract initial candidate requirements (explicit user values).
+    4. Merges the candidate into the state.
+    5. Returns an AgentTurn asking how the user wants unspecified details handled.
     """
     state = RequirementState()
     state._initial_prompt = prompt
     _SESSIONS[state.session_id] = state
+
+    # Detect unit mentions in the prompt text
+    det_unit, is_ambig = detect_unit_in_text(prompt)
+    if is_ambig:
+        state.ambiguities.append(
+            "Ambiguous unit mention detected in building description. Please clarify measurement units."
+        )
+    elif det_unit:
+        state.user_supplied_units = det_unit
+        state._update_scalar("units", "m", FieldSource.USER_EXPLICIT)
+        state.checklist["units"].notes = f"Canonical unit: metres (user specified: {det_unit})"
 
     # --- Call Gemini for initial extraction ---
     try:
@@ -138,7 +150,18 @@ def start_session(prompt: str) -> AgentTurn:
     except Exception as exc:  # noqa: BLE001
         return _error_turn(state, f"Unexpected error during extraction: {exc}")
 
-    return _build_agent_turn(state)
+    # Return the initial defaults preference prompt
+    return AgentTurn(
+        status=SessionStatus.NEEDS_CLARIFICATION,
+        session_id=state.session_id,
+        clarification_round=state.clarification_round,
+        message=DEFAULTS_PREFERENCE_PROMPT,
+        pending_fields=["defaults_preference"],
+        requirements=_compact_current_values(state),
+        errors=[],
+        warnings=list(state.warnings),
+        is_finalized=False,
+    )
 
 
 def process_user_reply(session_id: str, reply: str) -> AgentTurn:
@@ -147,18 +170,11 @@ def process_user_reply(session_id: str, reply: str) -> AgentTurn:
 
     1. Retrieve session state.
     2. Check for confirmation intent (finalize only if awaiting confirmation).
-    3. Check for "use defaults" intent (apply all eligible defaults).
-    4. Otherwise, determine whether to call Gemini for interpretation.
-    5. Merge updates, increment round, re-check, and return next turn.
-
-    Parameters
-    ----------
-    session_id : str
-    reply : str
-
-    Returns
-    -------
-    AgentTurn
+    3. Check and apply initial defaults preference if pending.
+    4. Check for 'use defaults' intent at any round.
+    5. Interpret reply (LLM or deterministic parsing).
+    6. Merge updates without overwriting explicit user values.
+    7. Increment round (if not initial preference turn) and return next turn.
     """
     state = _SESSIONS.get(session_id)
     if state is None:
@@ -180,8 +196,41 @@ def process_user_reply(session_id: str, reply: str) -> AgentTurn:
     if state.status == SessionStatus.AWAITING_CONFIRMATION and _is_confirmation(reply):
         return _finalize_session(state)
 
-    # --- "Use defaults" intent ---
+    # --- Initial Defaults Preference Handling ---
+    if state.defaults_preference is None:
+        pref, cats = parse_preference_reply(reply)
+        clean = reply.strip().lower()
+        if pref == "hybrid" and not cats and clean in ("3", "3.", "hybrid", "3. hybrid", "option 3"):
+            state.set_defaults_preference("hybrid", [])
+            return AgentTurn(
+                status=SessionStatus.NEEDS_CLARIFICATION,
+                session_id=state.session_id,
+                clarification_round=state.clarification_round,
+                message=(
+                    "Which categories would you like to default, and which would you like to specify manually?\n"
+                    "(e.g. 'use default dimensions, but ask me about room connections')"
+                ),
+                pending_fields=["defaults_preference_categories"],
+                requirements=_compact_current_values(state),
+                errors=[],
+                warnings=list(state.warnings),
+                is_finalized=False,
+            )
+        if pref:
+            state.set_defaults_preference(pref, cats)
+            return _build_agent_turn(state)
+
+    # If hybrid mode is waiting for category specification
+    if state.defaults_preference == "hybrid" and not state.hybrid_default_categories:
+        pref, cats = parse_preference_reply(reply)
+        if cats:
+            state.hybrid_default_categories = cats
+            return _build_agent_turn(state)
+
+    # --- "Use defaults" intent at any time ---
     use_defaults = _dialogue.is_use_defaults_reply(reply)
+    if use_defaults:
+        state.set_defaults_preference("use_defaults")
 
     # --- Determine whether we need Gemini to interpret the reply ---
     current_check = _checker.check(state)
@@ -349,21 +398,30 @@ def _build_extraction_result(state: RequirementState) -> ExtractionResult:
     for field_name, entry in state.checklist.items():
         if entry.source:
             provenance[field_name] = entry.source.value
+    for r_id, fields in state.room_field_sources.items():
+        for f_name, src in fields.items():
+            provenance[f"{r_id}.{f_name}"] = src.value
 
     defaults_applied = [
         f for f, entry in state.checklist.items()
         if entry.source == FieldSource.SYSTEM_DEFAULT
     ]
-    # Also track room-level defaults
-    for room in state.rooms:
-        # We don't track room-level defaults in the checklist, so check values
-        pass
+    for r_id, fields in state.room_field_sources.items():
+        for f_name, src in fields.items():
+            if src == FieldSource.SYSTEM_DEFAULT:
+                defaults_applied.append(f"{r_id}_{f_name}")
+    for rel in state.relationships:
+        if getattr(rel, "source", None) == FieldSource.SYSTEM_DEFAULT:
+            defaults_applied.append(f"rel_{rel.room_a}_{rel.relationship.value}_{rel.room_b}")
 
-    # Build overall_dimensions from state defaults
-    wall_thickness = None
-    floor_height = None
-    if "wall_thickness_mm" in DEFAULTS:
-        wall_thickness = DEFAULTS["wall_thickness_mm"].value
+    # Build overall_dimensions from state defaults in canonical metres
+    wall_thickness = 0.2
+    if "wall_thickness_m" in DEFAULTS:
+        wall_thickness = DEFAULTS["wall_thickness_m"].value
+    elif "wall_thickness_mm" in DEFAULTS:
+        wall_thickness = DEFAULTS["wall_thickness_mm"].value / 1000.0
+
+    floor_height = 3.0
     if "floor_height_m" in DEFAULTS:
         floor_height = DEFAULTS["floor_height_m"].value
 
@@ -371,7 +429,7 @@ def _build_extraction_result(state: RequirementState) -> ExtractionResult:
         width_m=None,
         length_m=None,
         floor_height_m=floor_height,
-        wall_thickness_mm=wall_thickness,
+        wall_thickness_m=wall_thickness,
     )
 
     try:
@@ -379,7 +437,8 @@ def _build_extraction_result(state: RequirementState) -> ExtractionResult:
             session_id=state.session_id,
             building_type=BuildingType(state.checklist["building_type"].value),
             floor_count=state.checklist["floor_count"].value,
-            units=state.checklist["units"].value or "mm",
+            units="m",
+            user_supplied_units=state.user_supplied_units,
             rooms=list(state.rooms),
             overall_dimensions=dims,
             relationships=list(state.relationships),
@@ -485,7 +544,24 @@ def _parse_simple_reply(reply: str, state: RequirementState) -> None:
     if units_entry.status == FieldStatus.MISSING:
         for u in ("mm", "cm", "m", "ft", "in"):
             if re.search(rf"\b{u}\b", clean):
-                state._update_scalar("units", u, FieldSource.USER_EXPLICIT)
+                state.user_supplied_units = u
+                state._update_scalar("units", "m", FieldSource.USER_EXPLICIT)
+                state.checklist["units"].notes = f"Canonical unit: metres (user specified: {u})"
+                return
+
+    # Deterministic room dimension updates or corrections
+    for r in state.rooms:
+        r_id = (r.room_id or r.room_type).lower()
+        if r_id in clean or r.room_type.lower() in clean:
+            dim_match = re.search(r"(\d+(?:\.\d+)?)\s*(?:m|metres?)?\s*(?:x|by|\*)\s*(\d+(?:\.\d+)?)\s*(?:m|metres?)?", clean)
+            if dim_match:
+                w = float(dim_match.group(1))
+                l = float(dim_match.group(2))
+                target_id = r.room_id or r.room_type
+                r.width_m = w
+                r.length_m = l
+                state.set_room_field_source(target_id, "width_m", FieldSource.USER_EXPLICIT)
+                state.set_room_field_source(target_id, "length_m", FieldSource.USER_EXPLICIT)
                 return
 
 
@@ -495,12 +571,32 @@ def _compact_current_values(state: RequirementState) -> Dict[str, Any]:
     for k, entry in state.checklist.items():
         if entry.value is not None:
             result[k] = entry.value
+    if state.user_supplied_units:
+        result["user_supplied_units"] = state.user_supplied_units
+    if state.defaults_preference:
+        result["defaults_preference"] = state.defaults_preference
     if state.rooms:
         result["rooms"] = [
-            {"room_id": r.room_id, "room_type": r.room_type, "count": r.count}
-            if r.room_id
-            else {"room_type": r.room_type, "count": r.count}
+            {
+                "room_id": r.room_id,
+                "room_type": r.room_type,
+                "count": r.count,
+                "width_m": r.width_m,
+                "length_m": r.length_m,
+                "window_count": r.window_count,
+                "door_count": r.door_count,
+            }
             for r in state.rooms
+        ]
+    if state.relationships:
+        result["relationships"] = [
+            {
+                "room_a": r.room_a,
+                "room_b": r.room_b,
+                "relationship": r.relationship.value,
+                "negative": getattr(r, "negative", False),
+            }
+            for r in state.relationships
         ]
     return result
 

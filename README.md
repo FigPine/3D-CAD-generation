@@ -190,7 +190,7 @@ The finalized `ExtractionResult` is a Pydantic model serialized to JSON:
     {"room_type": "bathroom", "count": 1, "window_count": 1, "door_count": 1, ...},
     {"room_type": "hall", "count": 1, "window_count": 0, "door_count": 1, ...}
   ],
-  "overall_dimensions": {"wall_thickness_mm": 200, "floor_height_m": 3.0, ...},
+  "overall_dimensions": {"wall_thickness_m": 0.2, "floor_height_m": 3.0, ...},
   "relationships": [],
   "constraints": [],
   "preferences": [],
@@ -213,9 +213,9 @@ Defaults are prototype values — **not architectural standards**.
 
 | Field | Default | Rationale |
 |---|---|---|
-| `units` | `mm` | Standard unit for architectural drawings |
+| `units` | `m` | Canonical unit for architectural dimensions |
 | `floor_count` | `1` | Prototype supports single-floor only |
-| `wall_thickness_mm` | `200 mm` | Typical internal wall |
+| `wall_thickness_m` | `0.2 m` | Typical internal wall (0.2 m) |
 | `floor_height_m` | `3.0 m` | Standard residential ceiling height |
 | `bedroom` windows | `1` | Natural light / ventilation |
 | `bathroom` windows | `1` | Ventilation |

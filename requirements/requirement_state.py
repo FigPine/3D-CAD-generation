@@ -40,6 +40,7 @@ from schemas import (
     RoomSpec,
     SessionStatus,
 )
+from requirements.unit_normalizer import canonicalize_unit_name, normalize_to_metres
 
 
 # ---------------------------------------------------------------------------
@@ -90,18 +91,27 @@ class RequirementState:
         self.created_at: str = datetime.now(timezone.utc).isoformat()
         self.status: SessionStatus = SessionStatus.NEEDS_CLARIFICATION
 
-        # Scalar checklist fields
+        # Scalar checklist fields (canonical units is always 'm')
         self.checklist: Dict[str, FieldEntry] = {
             "building_type": FieldEntry(blocking=True),
             "floor_count": FieldEntry(blocking=True),
-            "units": FieldEntry(blocking=False),  # can always be defaulted
+            "units": FieldEntry(blocking=False),  # can always be defaulted to 'm'
         }
+
+        # Defaults preference state (None = not yet asked/selected)
+        # Options: "use_defaults", "specify_details", "hybrid"
+        self.defaults_preference: Optional[str] = None
+        self.hybrid_default_categories: List[str] = []
+        self.user_supplied_units: Optional[str] = None
 
         # Structured sub-collections
         self.rooms: List[RoomSpec] = []
         self.relationships: List[RoomRelationship] = []
         self.constraints: List[str] = []
         self.preferences: List[str] = []
+
+        # Provenance tracking for individual room fields: {room_id: {field: FieldSource}}
+        self.room_field_sources: Dict[str, Dict[str, FieldSource]] = {}
 
         # Dialogue metadata
         self.pending_questions: List[str] = []
@@ -143,8 +153,18 @@ class RequirementState:
         if candidate.floor_count is not None:
             self._update_scalar("floor_count", candidate.floor_count, source)
 
+        # --- Units and canonical unit handling ---
         if candidate.units is not None:
-            self._update_scalar("units", candidate.units, source)
+            raw_u = candidate.units.strip()
+            canon_u = canonicalize_unit_name(raw_u)
+            if canon_u:
+                self.user_supplied_units = canon_u
+                self._update_scalar("units", "m", source)
+                self.checklist["units"].notes = f"Canonical unit: metres (user specified: {raw_u})"
+            else:
+                amb_msg = f"Unrecognized unit system '{raw_u}'. Supported units: m, cm, mm, ft, in."
+                if amb_msg not in self.ambiguities:
+                    self.ambiguities.append(amb_msg)
 
         # --- Rooms ---
         if candidate.rooms:
@@ -173,6 +193,77 @@ class RequirementState:
                     self.ambiguities.append(note)
 
         self.recalculate_warnings()
+
+    def allows_default(self, category: str) -> bool:
+        """
+        Return True if system defaults are permitted for the given category.
+
+        Categories:
+          - 'dimensions' (room dimensions, wall thickness, floor height)
+          - 'openings' (doors, windows)
+          - 'relationships' (connectivity defaults)
+          - 'units' (measurement unit)
+        """
+        if self.defaults_preference == "use_defaults":
+            return True
+        if self.defaults_preference == "specify_details":
+            return False
+        if self.defaults_preference == "hybrid":
+            cat_norm = category.strip().lower()
+            dim_synonyms = {"dimension", "dimensions", "room_dimensions", "size", "sizes"}
+            rel_synonyms = {"relationship", "relationships", "connection", "connections", "room_connections"}
+            op_synonyms = {"opening", "openings", "doors", "windows", "doors_and_windows"}
+            unit_synonyms = {"unit", "units"}
+
+            for allowed in self.hybrid_default_categories:
+                a_clean = allowed.strip().lower()
+                if cat_norm in dim_synonyms and a_clean in dim_synonyms:
+                    return True
+                if cat_norm in rel_synonyms and a_clean in rel_synonyms:
+                    return True
+                if cat_norm in op_synonyms and a_clean in op_synonyms:
+                    return True
+                if cat_norm in unit_synonyms and a_clean in unit_synonyms:
+                    return True
+                if cat_norm == a_clean:
+                    return True
+            return False
+        return False
+
+    def set_defaults_preference(
+        self,
+        preference: str,
+        categories: Optional[List[str]] = None,
+    ) -> None:
+        """Set and persist the user's defaults preference throughout the session."""
+        self.defaults_preference = preference
+        if categories is not None:
+            self.hybrid_default_categories = list(categories)
+
+    def set_room_field_source(
+        self, room_id: str, field_name: str, source: FieldSource
+    ) -> None:
+        """Record provenance for a room-level field."""
+        if room_id not in self.room_field_sources:
+            self.room_field_sources[room_id] = {}
+        self.room_field_sources[room_id][field_name] = source
+
+    def get_room_field_source(
+        self, room_id: str, field_name: str
+    ) -> Optional[FieldSource]:
+        """Return provenance for a room-level field."""
+        return self.room_field_sources.get(room_id, {}).get(field_name)
+
+    def _normalize_dimension(self, val: Optional[float]) -> Optional[float]:
+        """Convert a dimension value to canonical metres if user supplied non-metre units."""
+        if val is None:
+            return None
+        if self.user_supplied_units and self.user_supplied_units != "m":
+            try:
+                return normalize_to_metres(val, self.user_supplied_units)
+            except ValueError:
+                pass
+        return round(val, 4)
 
     def _update_scalar(
         self, field: str, new_value: Any, source: FieldSource
@@ -228,6 +319,18 @@ class RequirementState:
         """
         if not self.rooms:
             self.rooms = canonicalize_rooms(new_rooms)
+            for r in self.rooms:
+                r_id = r.room_id or r.room_type
+                if r.width_m is not None:
+                    r.width_m = self._normalize_dimension(r.width_m)
+                    self.set_room_field_source(r_id, "width_m", source)
+                if r.length_m is not None:
+                    r.length_m = self._normalize_dimension(r.length_m)
+                    self.set_room_field_source(r_id, "length_m", source)
+                if r.window_count is not None:
+                    self.set_room_field_source(r_id, "window_count", source)
+                if r.door_count is not None:
+                    self.set_room_field_source(r_id, "door_count", source)
             return
 
         # Ensure existing rooms are canonical
@@ -249,44 +352,69 @@ class RequirementState:
 
             if matched_rooms:
                 for target in matched_rooms:
+                    t_id = target.room_id or target.room_type
                     if new_room.window_count is not None:
                         target.window_count = new_room.window_count
+                        self.set_room_field_source(t_id, "window_count", source)
                     if new_room.door_count is not None:
                         target.door_count = new_room.door_count
+                        self.set_room_field_source(t_id, "door_count", source)
                     if new_room.width_m is not None:
-                        target.width_m = new_room.width_m
+                        target.width_m = self._normalize_dimension(new_room.width_m)
+                        self.set_room_field_source(t_id, "width_m", source)
                     if new_room.length_m is not None:
-                        target.length_m = new_room.length_m
+                        target.length_m = self._normalize_dimension(new_room.length_m)
+                        self.set_room_field_source(t_id, "length_m", source)
                     if new_room.notes:
                         target.notes = new_room.notes
             else:
+                w_norm = self._normalize_dimension(new_room.width_m)
+                l_norm = self._normalize_dimension(new_room.length_m)
                 if new_room.count > 1 and idx is None:
                     for i in range(1, new_room.count + 1):
+                        r_id = f"{base}_{i}"
                         self.rooms.append(
                             RoomSpec(
-                                room_id=f"{base}_{i}",
+                                room_id=r_id,
                                 room_type=base,
                                 count=1,
                                 window_count=new_room.window_count,
                                 door_count=new_room.door_count,
-                                width_m=new_room.width_m,
-                                length_m=new_room.length_m,
+                                width_m=w_norm,
+                                length_m=l_norm,
                                 notes=new_room.notes,
                             )
                         )
+                        if new_room.window_count is not None:
+                            self.set_room_field_source(r_id, "window_count", source)
+                        if new_room.door_count is not None:
+                            self.set_room_field_source(r_id, "door_count", source)
+                        if w_norm is not None:
+                            self.set_room_field_source(r_id, "width_m", source)
+                        if l_norm is not None:
+                            self.set_room_field_source(r_id, "length_m", source)
                 else:
+                    r_id = f"{base}_{idx or 1}"
                     self.rooms.append(
                         RoomSpec(
-                            room_id=f"{base}_{idx or 1}",
+                            room_id=r_id,
                             room_type=base,
                             count=1,
                             window_count=new_room.window_count,
                             door_count=new_room.door_count,
-                            width_m=new_room.width_m,
-                            length_m=new_room.length_m,
+                            width_m=w_norm,
+                            length_m=l_norm,
                             notes=new_room.notes,
                         )
                     )
+                    if new_room.window_count is not None:
+                        self.set_room_field_source(r_id, "window_count", source)
+                    if new_room.door_count is not None:
+                        self.set_room_field_source(r_id, "door_count", source)
+                    if w_norm is not None:
+                        self.set_room_field_source(r_id, "width_m", source)
+                    if l_norm is not None:
+                        self.set_room_field_source(r_id, "length_m", source)
 
         self.rooms = canonicalize_rooms(self.rooms)
 
@@ -295,7 +423,7 @@ class RequirementState:
     ) -> None:
         """Merge relationships and normalize room endpoints to canonical room IDs."""
         self.normalize_rooms()
-        valid_ids = {r.room_id: r.room_id for r in self.rooms if r.room_id}
+        valid_ids = {r.room_id.lower(): r.room_id for r in self.rooms if r.room_id}
 
         type_counts: Dict[str, int] = {}
         for r in self.rooms:
@@ -304,22 +432,66 @@ class RequirementState:
             r.room_type: r.room_id for r in self.rooms if type_counts.get(r.room_type) == 1
         }
 
-        existing = {(r.room_a, r.room_b, r.relationship) for r in self.relationships}
+        # Track existing relationships by canonical pair to prevent duplicates
+        existing = set()
+        for r in self.relationships:
+            a_low = r.room_a.lower()
+            b_low = r.room_b.lower()
+            is_neg = getattr(r, "negative", False)
+            pair_key = (min(a_low, b_low), max(a_low, b_low), r.relationship, is_neg)
+            existing.add(pair_key)
 
         for rel in new_rels:
-            a_norm = normalize_room_id(rel.room_a)
-            b_norm = normalize_room_id(rel.room_b)
+            a_raw = rel.room_a.strip()
+            b_raw = rel.room_b.strip()
 
-            norm_a = a_norm if a_norm in valid_ids else unique_type_to_id.get(rel.room_a.lower(), a_norm)
-            norm_b = b_norm if b_norm in valid_ids else unique_type_to_id.get(rel.room_b.lower(), b_norm)
+            a_norm = normalize_room_id(a_raw)
+            b_norm = normalize_room_id(b_raw)
+
+            base_a, idx_a = parse_room_name(a_raw)
+            base_b, idx_b = parse_room_name(b_raw)
+
+            # Check for ambiguous room reference (e.g. 'bedroom' when 2 bedrooms exist)
+            if idx_a is None and type_counts.get(base_a, 0) > 1:
+                amb_msg = (
+                    f"Ambiguous room reference '{a_raw}' in relationship: "
+                    f"there are {type_counts[base_a]} {base_a}s. Please clarify which room."
+                )
+                if amb_msg not in self.ambiguities:
+                    self.ambiguities.append(amb_msg)
+                continue
+
+            if idx_b is None and type_counts.get(base_b, 0) > 1:
+                amb_msg = (
+                    f"Ambiguous room reference '{b_raw}' in relationship: "
+                    f"there are {type_counts[base_b]} {base_b}s. Please clarify which room."
+                )
+                if amb_msg not in self.ambiguities:
+                    self.ambiguities.append(amb_msg)
+                continue
+
+            norm_a = valid_ids.get(a_norm.lower()) or unique_type_to_id.get(base_a)
+            norm_b = valid_ids.get(b_norm.lower()) or unique_type_to_id.get(base_b)
+
+            if not norm_a or not norm_b:
+                missing_endpoint = a_raw if not norm_a else b_raw
+                amb_msg = f"Relationship references room '{missing_endpoint}' which does not exist in the room list."
+                if amb_msg not in self.ambiguities:
+                    self.ambiguities.append(amb_msg)
+                continue
+
+            is_neg = getattr(rel, "negative", False)
+            rel_src = getattr(rel, "source", None) or FieldSource.USER_EXPLICIT
 
             resolved_rel = RoomRelationship(
                 room_a=norm_a,
                 room_b=norm_b,
                 relationship=rel.relationship,
                 notes=rel.notes,
+                negative=is_neg,
+                source=rel_src,
             )
-            key = (resolved_rel.room_a, resolved_rel.room_b, resolved_rel.relationship)
+            key = (min(norm_a.lower(), norm_b.lower()), max(norm_a.lower(), norm_b.lower()), resolved_rel.relationship, is_neg)
             if key not in existing:
                 self.relationships.append(resolved_rel)
                 existing.add(key)
@@ -371,10 +543,74 @@ class RequirementState:
                 or r_base == target_base
             )
             if matches:
+                r_id = room.room_id or room.room_type
                 if room.window_count is None and window_count is not None:
                     object.__setattr__(room, "window_count", window_count)
+                    self.set_room_field_source(r_id, "window_count", FieldSource.SYSTEM_DEFAULT)
                 if room.door_count is None and door_count is not None:
                     object.__setattr__(room, "door_count", door_count)
+                    self.set_room_field_source(r_id, "door_count", FieldSource.SYSTEM_DEFAULT)
+
+    def apply_room_dimension_defaults(
+        self,
+        room_type: str,
+        width_m: Optional[float],
+        length_m: Optional[float],
+        notes: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Apply dimension defaults to all rooms matching room_type that lack them.
+
+        Returns list of applied default field names.
+        Preserves explicit user dimensions and only applies if allowed by preference.
+        """
+        applied: List[str] = []
+        clean_target = room_type.strip().lower().replace("-", "_").replace(" ", "_")
+        target_base, _ = parse_room_name(clean_target)
+        for room in self.rooms:
+            r_base, _ = parse_room_name(room.room_id or room.room_type)
+            matches = (
+                room.room_id == room_type
+                or room.room_type == room_type
+                or r_base == clean_target
+                or r_base == target_base
+            )
+            if matches:
+                r_id = room.room_id or room.room_type
+                if room.width_m is None and width_m is not None:
+                    if self.get_room_field_source(r_id, "width_m") != FieldSource.USER_EXPLICIT:
+                        room.width_m = width_m
+                        applied.append(f"{r_id}_width_m")
+                        self.set_room_field_source(r_id, "width_m", FieldSource.SYSTEM_DEFAULT)
+                if room.length_m is None and length_m is not None:
+                    if self.get_room_field_source(r_id, "length_m") != FieldSource.USER_EXPLICIT:
+                        room.length_m = length_m
+                        applied.append(f"{r_id}_length_m")
+                        self.set_room_field_source(r_id, "length_m", FieldSource.SYSTEM_DEFAULT)
+        return applied
+
+    def apply_relationship_defaults(
+        self, new_rels: List[RoomRelationship]
+    ) -> List[str]:
+        """
+        Apply defaulted relationships to state.
+
+        Returns list of applied relationship identifiers.
+        Preserves explicit positive and negative constraints.
+        """
+        applied: List[str] = []
+        existing = {
+            (min(r.room_a.lower(), r.room_b.lower()), max(r.room_a.lower(), r.room_b.lower()), r.relationship, getattr(r, "negative", False))
+            for r in self.relationships
+        }
+        for rel in new_rels:
+            is_neg = getattr(rel, "negative", False)
+            key = (min(rel.room_a.lower(), rel.room_b.lower()), max(rel.room_a.lower(), rel.room_b.lower()), rel.relationship, is_neg)
+            if key not in existing:
+                self.relationships.append(rel)
+                existing.add(key)
+                applied.append(f"rel_{rel.room_a}_{rel.relationship.value}_{rel.room_b}")
+        return applied
 
     def check_user_reply_resolutions(self, reply: str) -> None:
         """
@@ -500,6 +736,13 @@ class RequirementState:
             "clarification_round": self.clarification_round,
             "confirmed_by_user": self.confirmed_by_user,
             "created_at": self.created_at,
+            "defaults_preference": self.defaults_preference,
+            "hybrid_default_categories": self.hybrid_default_categories,
+            "user_supplied_units": self.user_supplied_units,
+            "room_field_sources": {
+                r_id: {k: v.value for k, v in fields.items()}
+                for r_id, fields in self.room_field_sources.items()
+            },
             "checklist": {
                 k: v.model_dump() for k, v in self.checklist.items()
             },
@@ -524,6 +767,15 @@ class RequirementState:
         state.clarification_round = data["clarification_round"]
         state.confirmed_by_user = data.get("confirmed_by_user", False)
         state.created_at = data.get("created_at", state.created_at)
+        state.defaults_preference = data.get("defaults_preference")
+        state.hybrid_default_categories = data.get("hybrid_default_categories", [])
+        state.user_supplied_units = data.get("user_supplied_units")
+        raw_sources = data.get("room_field_sources", {})
+        for r_id, fields in raw_sources.items():
+            state.room_field_sources[r_id] = {
+                k: FieldSource(v) for k, v in fields.items()
+            }
+
         if "status" in data:
             try:
                 state.status = SessionStatus(data["status"])

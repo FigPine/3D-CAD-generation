@@ -64,8 +64,26 @@ class BuildingType(str, Enum):
 class RelationshipType(str, Enum):
     ADJACENT_TO = "adjacent_to"
     CONNECTS_TO = "connects_to"
+    SHARES_WALL_WITH = "shares_wall_with"
     SHARED_FACILITY = "shared_facility"
     OPPOSITE_TO = "opposite_to"
+
+
+class DefaultsPreference(str, Enum):
+    """User preference for handling unspecified building details."""
+
+    USE_DEFAULTS = "use_defaults"
+    SPECIFY_DETAILS = "specify_details"
+    HYBRID = "hybrid"
+
+
+class DefaultsCategory(str, Enum):
+    """Categories of defaults that can be selected in hybrid mode."""
+
+    DIMENSIONS = "dimensions"
+    OPENINGS = "openings"
+    RELATIONSHIPS = "relationships"
+    UNITS = "units"
 
 
 class SessionStatus(str, Enum):
@@ -101,23 +119,44 @@ class RoomSpec(BaseModel):
 class RoomRelationship(BaseModel):
     """Spatial or functional relationship between two named rooms."""
 
-    room_a: str = Field(..., description="First room type (e.g. 'kitchen').")
-    room_b: str = Field(..., description="Second room type (e.g. 'hall').")
+    room_a: str = Field(..., description="First room type or canonical room ID (e.g. 'bedroom_1').")
+    room_b: str = Field(..., description="Second room type or canonical room ID (e.g. 'hall_1').")
     relationship: RelationshipType = Field(..., description="Type of relationship.")
     notes: Optional[str] = None
+    negative: bool = Field(False, description="If True, indicates the rooms must NOT have this relationship.")
+    source: Optional[FieldSource] = Field(None, description="Provenance of relationship.")
 
     model_config = {"extra": "forbid"}
 
 
 class Dimensions(BaseModel):
-    """Overall building footprint dimensions."""
+    """Overall building footprint dimensions in canonical metres."""
 
     width_m: Optional[float] = Field(None, gt=0)
     length_m: Optional[float] = Field(None, gt=0)
     floor_height_m: Optional[float] = Field(None, gt=0)
-    wall_thickness_mm: Optional[float] = Field(None, gt=0)
+    wall_thickness_m: Optional[float] = Field(None, gt=0)
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def handle_wall_thickness_mm(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Backward compatibility: accept wall_thickness_mm and convert to wall_thickness_m
+            if "wall_thickness_mm" in data and "wall_thickness_m" not in data:
+                val = data.pop("wall_thickness_mm")
+                data["wall_thickness_m"] = round(val / 1000.0, 4) if val is not None else None
+            elif "wall_thickness_mm" in data and "wall_thickness_m" in data:
+                data.pop("wall_thickness_mm")
+        return data
+
+    @property
+    def wall_thickness_mm(self) -> Optional[float]:
+        """Backward-compatibility property returning millimetres."""
+        if self.wall_thickness_m is not None:
+            return round(self.wall_thickness_m * 1000.0, 1)
+        return None
 
 
 class FieldEntry(BaseModel):
@@ -225,7 +264,8 @@ class ExtractionResult(BaseModel):
     session_id: str
     building_type: BuildingType
     floor_count: int = Field(..., ge=1)
-    units: str = Field(..., description="Canonical unit for all dimensions, e.g. 'mm'.")
+    units: str = Field("m", description="Canonical unit for all dimensions, always 'm'.")
+    user_supplied_units: Optional[str] = Field(None, description="Original unit specified by the user (e.g. 'ft', 'cm', 'mm', 'in', 'm').")
     rooms: List[RoomSpec]
     overall_dimensions: Dimensions
     relationships: List[RoomRelationship] = Field(default_factory=list)

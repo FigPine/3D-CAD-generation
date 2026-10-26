@@ -56,13 +56,14 @@ SCHEMA (all fields optional — use null when not mentioned):
     "width_m": number | null,
     "length_m": number | null,
     "floor_height_m": number | null,
-    "wall_thickness_mm": number | null
+    "wall_thickness_m": number | null
   } | null,
   "relationships": [
     {
       "room_a": string,
       "room_b": string,
-      "relationship": "adjacent_to" | "connects_to" | "shared_facility" | "opposite_to",
+      "relationship": "adjacent_to" | "connects_to" | "shares_wall_with" | "shared_facility" | "opposite_to",
+      "negative": boolean | null,
       "notes": string | null
     }
   ] | null,
@@ -74,11 +75,14 @@ SCHEMA (all fields optional — use null when not mentioned):
 
 RULES:
 1. Use null for any field the user did not explicitly state.
-2. Do not infer dimensions or counts unless the user stated them.
-3. Add a note to "ambiguities" for any value that was unclear or could have
-   multiple interpretations.
-4. For relationships, use only the four allowed types. If the user says
-   "next to" or "beside", map it to "adjacent_to".
+2. Do not infer dimensions or counts unless the user stated them. Do not perform arithmetic or unit conversion; output values and units as stated.
+3. Add a note to "ambiguities" for any value or room reference that was unclear or could refer to multiple rooms.
+4. For relationships, extract explicit connections, adjacencies, and shared walls:
+   - "connects_to": rooms connected by a doorway, passage, or direct access.
+   - "adjacent_to": rooms positioned beside or next to each other.
+   - "shares_wall_with": rooms sharing a physical wall.
+   Do not treat connectivity, adjacency, and shared walls as interchangeable.
+   If the user states a negative constraint (e.g. "bedroom 1 must not connect to bathroom"), set "negative" to true and also record it in "constraints".
 5. The "constraints" field is for explicit must/must-not statements.
 6. The "preferences" field is for aesthetic or non-blocking wishes.
 7. Output ONLY valid JSON. Do not include markdown code fences, explanation,
