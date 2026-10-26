@@ -15,6 +15,8 @@ Public interface (matches the spec §3.1)
     process_user_reply(sid, reply)   -> AgentTurn
     get_session_state(sid)           -> dict
     finalize_requirements(sid)       -> ExtractionResult
+    get_building_ir(sid)             -> Optional[dict]
+    build_ir_from_file(req_path)     -> Tuple[dict, str]
 
 Design principles
 -----------------
@@ -37,7 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from schemas import (
     AgentTurn,
@@ -69,6 +71,7 @@ from llm.prompts import (
     build_extraction_prompt,
     build_followup_prompt,
 )
+from IR_builder import build_ir, IRBuilderError
 
 # ---------------------------------------------------------------------------
 # Simple keyword detection for user confirmation replies
@@ -89,6 +92,9 @@ _CONFIRM_RE = re.compile("|".join(_CONFIRM_PATTERNS), re.IGNORECASE)
 
 # In-memory session store: session_id -> RequirementState
 _SESSIONS: Dict[str, RequirementState] = {}
+
+# In-memory Building IR store: session_id -> Building IR v1 document
+_BUILDING_IR_STORE: Dict[str, Dict[str, Any]] = {}
 
 # Shared subsystem instances (stateless — safe to share)
 _checker = CompletenessChecker()
@@ -360,19 +366,91 @@ def finalize_requirements(session_id: str) -> ExtractionResult:
     """
     Validate and package the final requirements for the Building IR module.
 
+    Constructs and caches the Building IR v1 document, saves output JSON files,
+    and returns the validated ExtractionResult.
+
     Raises
     ------
     ValidationError
         If the state does not pass final validation.
     KeyError
         If the session is not found.
+    IRBuilderError
+        If the Building IR cannot be constructed.
     """
     state = _SESSIONS.get(session_id)
     if state is None:
         raise KeyError(f"Session '{session_id}' not found.")
     state.normalize_rooms()
     _validator.validate_or_raise(state)
-    return _build_extraction_result(state)
+    result = _build_extraction_result(state)
+
+    # Construct Building IR v1 and cache it
+    ir_doc = build_ir(result, session_id=session_id)
+    _BUILDING_IR_STORE[session_id] = ir_doc
+
+    # Persist outputs
+    _save_output(session_id, result)
+    _save_ir_output(session_id, ir_doc)
+
+    return result
+
+
+def get_building_ir(session_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Return the constructed Building IR v1 document for a finalized session,
+    or None if not found or not yet finalized.
+    """
+    return _BUILDING_IR_STORE.get(session_id)
+
+
+def build_ir_from_file(
+    requirements_path: str,
+    output_path: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """
+    Load an existing requirements JSON file, construct Building IR v1,
+    cache it in the in-memory store, and save the resulting IR JSON file.
+
+    Parameters
+    ----------
+    requirements_path : str
+        Path to an existing requirements JSON file (e.g. outputs/<session_id>.json).
+    output_path : Optional[str]
+        Optional output path. If None, defaults to outputs/<session_id>_ir.json.
+
+    Returns
+    -------
+    Tuple[Dict[str, Any], str]
+        (ir_doc, saved_output_path)
+    """
+    if not os.path.isfile(requirements_path):
+        raise FileNotFoundError(f"Requirements file not found: '{requirements_path}'")
+
+    with open(requirements_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Expected JSON object in '{requirements_path}', got {type(data).__name__}."
+        )
+
+    session_id = str(data.get("session_id") or os.path.splitext(os.path.basename(requirements_path))[0])
+    ir_doc = build_ir(data, session_id=session_id)
+    _BUILDING_IR_STORE[session_id] = ir_doc
+
+    if output_path is None:
+        req_dir = os.path.dirname(requirements_path) or "outputs"
+        output_path = os.path.join(req_dir, f"{session_id}_ir.json")
+
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(ir_doc, f, indent=2)
+
+    return ir_doc, output_path
 
 
 # ---------------------------------------------------------------------------
@@ -446,15 +524,30 @@ def _finalize_session(state: RequirementState) -> AgentTurn:
             is_finalized=False,
         )
 
-    # Save JSON output
+    # Construct Building IR v1 document
+    try:
+        ir_doc = build_ir(result, session_id=state.session_id)
+        _BUILDING_IR_STORE[state.session_id] = ir_doc
+    except IRBuilderError as exc:
+        return AgentTurn(
+            status=SessionStatus.ERROR,
+            session_id=state.session_id,
+            clarification_round=state.clarification_round,
+            message=f"Building IR construction failed: {exc}",
+            errors=[str(exc)],
+            is_finalized=False,
+        )
+
+    # Save outputs
     _save_output(state.session_id, result)
+    _save_ir_output(state.session_id, ir_doc)
 
     return AgentTurn(
         status=SessionStatus.FINALIZED,
         session_id=state.session_id,
         clarification_round=state.clarification_round,
         message=(
-            "✅ Requirements finalized! The structured requirements have been saved.\n"
+            "✅ Requirements finalized! The structured requirements and Building IR have been saved.\n"
             f"Session ID: {state.session_id}"
         ),
         requirements=result.model_dump(),
@@ -959,7 +1052,7 @@ def _compact_current_values(state: RequirementState) -> Dict[str, Any]:
     return result
 
 
-def _save_output(session_id: str, result: ExtractionResult) -> None:
+def _save_output(session_id: str, result: ExtractionResult) -> Optional[str]:
     """Save the final ExtractionResult as JSON to the outputs/ directory."""
     try:
         outputs_dir = os.path.join(
@@ -969,5 +1062,21 @@ def _save_output(session_id: str, result: ExtractionResult) -> None:
         out_path = os.path.join(outputs_dir, f"{session_id}.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(result.model_dump(), f, indent=2)
+        return out_path
     except Exception:  # noqa: BLE001
-        pass  # saving is best-effort; don't crash finalization
+        return None  # saving is best-effort; don't crash finalization
+
+
+def _save_ir_output(session_id: str, ir_doc: Dict[str, Any]) -> Optional[str]:
+    """Save the constructed Building IR as JSON to the outputs/ directory."""
+    try:
+        outputs_dir = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "outputs"
+        )
+        os.makedirs(outputs_dir, exist_ok=True)
+        out_path = os.path.join(outputs_dir, f"{session_id}_ir.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(ir_doc, f, indent=2)
+        return out_path
+    except Exception:  # noqa: BLE001
+        return None  # saving is best-effort; don't crash finalization

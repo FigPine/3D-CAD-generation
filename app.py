@@ -30,8 +30,11 @@ For LM Studio:
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import sys
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Optional: load .env file if python-dotenv is installed
@@ -56,7 +59,9 @@ from agents.req_ext_agent import (
     start_session,
     process_user_reply,
     get_session_state,
+    build_ir_from_file,
 )
+from IR_builder import IRBuilderError
 from llm.base_client import LLMAuthError
 
 
@@ -98,12 +103,67 @@ def _display_turn(turn) -> None:
     print()
 
 
+def run_build_ir_cli(requirements_file: str, output_file: Optional[str] = None) -> None:
+    """Manually run Building IR construction on an existing requirements JSON file."""
+    print("\n" + "=" * 60)
+    print("  AI-Assisted 3D Building Model Generator")
+    print("  Building IR v1 Manual Generator")
+    print("=" * 60)
+    print(f"\n📂  Loading requirements from: {requirements_file}")
+
+    try:
+        ir_doc, saved_path = build_ir_from_file(requirements_file, output_file)
+    except FileNotFoundError as exc:
+        print(f"\n❌  File error: {exc}")
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"\n❌  JSON parse error in '{requirements_file}': {exc}")
+        sys.exit(1)
+    except IRBuilderError as exc:
+        print(f"\n❌  Building IR validation error: {exc}")
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001
+        print(f"\n❌  Unexpected error: {exc}")
+        sys.exit(1)
+
+    print("\n✅  Building IR v1 constructed and saved successfully.")
+    print(f"    IR Version  : {ir_doc.get('ir_version')}")
+    print(f"    Session ID  : {ir_doc.get('session_id')}")
+    print(f"    Building ID : {ir_doc.get('building', {}).get('id')}")
+    print(f"    Rooms       : {len(ir_doc.get('requirements', {}).get('rooms', []))}")
+    print(f"    Edges       : {len(ir_doc.get('requirements', {}).get('edges', []))}")
+    print(f"    Constraints : {len(ir_doc.get('requirements', {}).get('constraints', []))}")
+    print(f"    Saved to    : {saved_path}\n")
+
+
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="AI-Assisted 3D Building Model Generator",
+    )
+    parser.add_argument(
+        "--build-ir",
+        "-b",
+        metavar="REQUIREMENTS_FILE",
+        help="Path to an existing requirements JSON file to build Building IR without LLM calls.",
+    )
+    parser.add_argument(
+        "--output",
+        "-o",
+        metavar="OUTPUT_FILE",
+        help="Optional destination path for the generated Building IR JSON file.",
+    )
+
+    args = parser.parse_args()
+
+    if args.build_ir:
+        run_build_ir_cli(args.build_ir, args.output)
+        return
+
     _print_banner()
 
     # --- Provider selection ---
@@ -164,6 +224,7 @@ def main() -> None:
     print("\n✅  Session complete.")
     print(f"    Session ID : {session_id}")
     print(f"    Output     : outputs/{session_id}.json")
+    print(f"    Building IR: outputs/{session_id}_ir.json")
 
 
 if __name__ == "__main__":
