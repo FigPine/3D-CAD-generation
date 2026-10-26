@@ -105,19 +105,45 @@ class CompletenessChecker:
                         "must be at least 1."
                     )
 
-        # ----- 3. Unresolved conflicts from state -----
+        # ----- 3. Room dimensions and openings (when manual specification is required) -----
+        if state.defaults_preference is not None:
+            if not state.allows_default("dimensions") and state.rooms:
+                missing_dims = [
+                    r.room_id or r.room_type for r in state.rooms
+                    if r.width_m is None or r.length_m is None
+                ]
+                if missing_dims:
+                    missing.append(f"room_dimensions: {', '.join(missing_dims)}")
+
+            if not state.allows_default("openings") and state.rooms:
+                missing_openings = [
+                    r.room_id or r.room_type for r in state.rooms
+                    if r.window_count is None or r.door_count is None
+                ]
+                if missing_openings:
+                    missing.append(f"room_openings: {', '.join(missing_openings)}")
+
+
+        # ----- 4. Unresolved conflicts from state -----
         for conflict_msg in state.conflicts:
             if conflict_msg not in [c for c in conflicts]:
                 # Scalar conflicts already captured above; add free-form ones
                 conflicts.append(conflict_msg)
 
-        # ----- 4. Floor count prototype constraint -----
+        # ----- 5. Floor count prototype constraint -----
         fc_entry = state.checklist.get("floor_count")
         if fc_entry and fc_entry.value is not None and fc_entry.value != 1:
             conflicts.append(
                 f"floor_count={fc_entry.value} is not supported. "
                 "This prototype supports single-floor buildings only."
             )
+
+        # ----- 6. Domain Validation (relationship integrity, room limits, counts) -----
+        from validators.requirements_validator import RequirementsValidator
+        val_result = RequirementsValidator().validate(state)
+        for err in val_result.errors:
+            if not any(m in err for m in missing) and err not in conflicts:
+                conflicts.append(err)
 
         complete = not missing and not conflicts
 

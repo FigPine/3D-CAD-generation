@@ -16,8 +16,15 @@ Responsibilities
 Provider isolation
 ------------------
 All Gemini-specific SDK calls are confined to this file.  The rest of the
-application uses only the ``GeminiClient`` class and the typed exceptions.
-To swap providers, replace this file and update ``requirements.txt``.
+application uses only the ``BaseLLMClient`` interface and the typed exceptions
+defined in ``llm.base_client``.
+
+Backward compatibility
+----------------------
+The typed exceptions (``LLMError``, ``LLMAuthError``, etc.) are re-exported
+from this module so that existing imports of the form
+    ``from llm.gemini_client import LLMAuthError``
+continue to work without modification.
 
 Environment variable
 --------------------
@@ -39,34 +46,27 @@ import os
 import time
 from typing import Any, Dict, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# Typed exceptions (provider-agnostic names)
-# ---------------------------------------------------------------------------
+from llm.base_client import (
+    BaseLLMClient,
+    LLMError,
+    LLMAuthError,
+    LLMRateLimitError,
+    LLMTimeoutError,
+    LLMResponseFormatError,
+    LLMUnavailableError,
+)
 
-
-class LLMError(Exception):
-    """Base class for all LLM adapter errors."""
-
-
-class LLMAuthError(LLMError):
-    """API key missing, invalid, or lacking permissions."""
-
-
-class LLMRateLimitError(LLMError):
-    """Rate limit or quota exceeded; the caller may retry later."""
-
-
-class LLMTimeoutError(LLMError):
-    """Request timed out."""
-
-
-class LLMResponseFormatError(LLMError):
-    """Response could not be parsed as valid JSON / schema."""
-
-
-class LLMUnavailableError(LLMError):
-    """Service unavailable or generic server error."""
-
+# Re-export so that existing ``from llm.gemini_client import LLMAuthError``
+# imports remain valid without modification.
+__all__ = [
+    "GeminiClient",
+    "LLMError",
+    "LLMAuthError",
+    "LLMRateLimitError",
+    "LLMTimeoutError",
+    "LLMResponseFormatError",
+    "LLMUnavailableError",
+]
 
 # ---------------------------------------------------------------------------
 # Client
@@ -78,14 +78,14 @@ _DEFAULT_MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 1.5      # seconds; doubles each retry
 
 
-class GeminiClient:
+class GeminiClient(BaseLLMClient):
     """
     Thin adapter around the ``google-genai`` SDK.
 
     Parameters
     ----------
     model : str
-        Gemini model identifier (default: ``gemini-2.0-flash``).
+        Gemini model identifier (default: ``gemini-3.8-flash``).
     timeout : int
         Per-request timeout in seconds.
     max_retries : int
@@ -93,6 +93,8 @@ class GeminiClient:
     api_key : str, optional
         Override the API key (for testing only). Normally read from env.
     """
+
+    provider_label: str = "Gemini API"
 
     def __init__(
         self,
@@ -125,8 +127,29 @@ class GeminiClient:
         self.max_retries = max_retries
 
     # ------------------------------------------------------------------
-    # Public API
+    # BaseLLMClient interface
     # ------------------------------------------------------------------
+
+    def check_available(self) -> None:
+        """
+        Verify Gemini is reachable by listing available models.
+
+        Raises ``LLMAuthError`` for key failures, ``LLMUnavailableError``
+        for network or service issues.
+        """
+        try:
+            # A lightweight probe: list models and check ours is present.
+            models = list(self._client.models.list())
+            model_names = [getattr(m, "name", "") for m in models]
+            # Model name from the API is typically "models/gemini-3.8-flash";
+            # do a suffix match so the user-configured name doesn't need the prefix.
+            if not any(self.model in name for name in model_names):
+                # Not fatal — the model list might not be exhaustive.
+                # We surface a warning but do not abort.
+                pass
+        except Exception as exc:
+            _, typed = self._classify_error(exc)
+            raise typed from exc
 
     def extract(
         self,

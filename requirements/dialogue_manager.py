@@ -89,7 +89,7 @@ def parse_preference_reply(reply: str) -> Tuple[Optional[str], List[str]]:
     is_hybrid = False
     categories: List[str] = []
 
-    if "hybrid" in clean or "but" in clean or ("default" in clean and any(w in clean for w in ("ask", "specify", "manual", "connect"))):
+    if "hybrid" in clean or "but" in clean or ("default" in clean and any(w in clean for w in ("ask", "specify", "manual", "connect", "everything", "rest", "else"))):
         is_hybrid = True
 
     # 1. Dimensions
@@ -114,6 +114,12 @@ def parse_preference_reply(reply: str) -> Tuple[Optional[str], List[str]]:
     if re.search(r"\b(default\s+units?|units?\s+default)\b", clean):
         is_hybrid = True
         categories.append("units")
+
+    # 5. Default everything else / default the rest
+    if re.search(r"\b(?:use\s+defaults?|default)\s+(?:values?\s+)?(?:for\s+)?(?:everything(?:\s+else)?|the\s+rest|all\s+else)\b", clean):
+        is_hybrid = True
+        if not categories:
+            categories.extend(["dimensions", "openings", "relationships", "units"])
 
     if is_hybrid:
         return "hybrid", categories
@@ -146,11 +152,14 @@ class DialogueManager:
         return bool(_USE_DEFAULTS_RE.search(reply))
 
     def apply_all_eligible_defaults(
-        self, state: RequirementState
+        self, state: RequirementState, force_defaults: bool = False
     ) -> List[str]:
         """
         Apply system defaults to MISSING eligible fields in ``state``,
         strictly respecting the selected defaults preference and permitted categories.
+
+        When ``force_defaults`` is True, applies safe defaults to any remaining
+        unresolved fields as fallback (e.g. after reaching MAX_ROUNDS).
 
         Returns a list of default keys / descriptions that were applied.
         Never overwrites explicit user values or CONFLICT fields.
@@ -158,7 +167,7 @@ class DialogueManager:
         applied: List[str] = []
 
         # --- 1. Units default ---
-        if state.allows_default("units"):
+        if force_defaults or state.allows_default("units"):
             entry = state.checklist.get("units")
             if entry and entry.status == FieldStatus.MISSING:
                 state.apply_default(
@@ -170,7 +179,7 @@ class DialogueManager:
                 applied.append("units")
 
         # --- 2. Dimension defaults ---
-        if state.allows_default("dimensions"):
+        if force_defaults or state.allows_default("dimensions"):
             # Floor height
             if "floor_height_m" not in applied:
                 applied.append("floor_height_m")
@@ -192,7 +201,7 @@ class DialogueManager:
                     applied.extend(res)
 
         # --- 3. Room opening defaults ---
-        if state.allows_default("openings"):
+        if force_defaults or state.allows_default("openings"):
             for room in state.rooms:
                 from requirements.requirement_state import parse_room_name
                 base_type, _ = parse_room_name(room.room_id or room.room_type)
@@ -216,7 +225,7 @@ class DialogueManager:
                     )
                     applied.append(f"{r_key}_door_count")
 
-        # --- 4. Relationship defaults (propose hall-to-bedrooms/bathroom) ---
+        # --- 4. Relationship defaults (only if explicitly authorized by user policy) ---
         if state.allows_default("relationships"):
             bt = state.get_scalar("building_type")
             if bt == "residential":
@@ -233,8 +242,7 @@ class DialogueManager:
 
     def _has_unspecified_manual_details(self, state: RequirementState) -> bool:
         """
-        Return True if there are room properties or relationships that the user
-        has elected to specify manually but has not yet provided.
+        Return True if there are room properties that the user has elected to specify manually but has not yet provided.
         """
         # If dimensions are not defaulted, check if any room lacks dimensions
         if not state.allows_default("dimensions"):
@@ -247,10 +255,6 @@ class DialogueManager:
             for r in state.rooms:
                 if r.window_count is None or r.door_count is None:
                     return True
-
-        # If relationships are not defaulted, check if relationships are empty for multi-room building
-        if not state.allows_default("relationships") and len(state.rooms) > 1 and not state.relationships:
-            return True
 
         return False
 
@@ -328,11 +332,25 @@ class DialogueManager:
                     [],
                 )
             if state.clarification_round >= MAX_ROUNDS:
-                return (
-                    SessionStatus.AWAITING_CONFIRMATION,
-                    self.build_confirmation_summary(state),
-                    [],
+                applied_fallback = self.apply_all_eligible_defaults(state, force_defaults=True)
+                state.normalize_rooms()
+                state.recalculate_warnings()
+                check = self._checker.check(state)
+                if not check.missing_fields and not check.conflict_fields:
+                    note = ""
+                    if applied_fallback:
+                        note = "\n\n" + format_defaults_summary(applied_fallback)
+                    return (
+                        SessionStatus.AWAITING_CONFIRMATION,
+                        self.build_confirmation_summary(state) + note,
+                        [],
+                    )
+                conflict_msg = (
+                    "⚠ Maximum clarification rounds reached. "
+                    "The following required fields have no safe defaults and must be provided:\n"
+                    + self._format_missing_fields(check.missing_fields)
                 )
+                return SessionStatus.CONFLICT, conflict_msg, check.missing_fields
             questions = self.generate_questions(check, state)
             round_num = state.clarification_round + 1
             header = f"[Round {round_num}/{MAX_ROUNDS}] "
@@ -352,7 +370,7 @@ class DialogueManager:
 
         # After round 3: apply defaults to remaining eligible fields as fallback
         if state.clarification_round >= MAX_ROUNDS:
-            applied = self.apply_all_eligible_defaults(state)
+            applied = self.apply_all_eligible_defaults(state, force_defaults=True)
             state.normalize_rooms()
             state.recalculate_warnings()
             check = self._checker.check(state)
@@ -447,6 +465,12 @@ class DialogueManager:
                 "(e.g. 'the hall connects to both bedrooms and the bathroom')"
             )
 
+        # Room reference ambiguities (unresolved and non-redundant only)
+        if state.ambiguities:
+            for amb in state.ambiguities:
+                if not any(amb.lower() in p.lower() for p in parts):
+                    parts.append(f"• {amb}")
+
         if not parts:
             parts.append(
                 "• Please provide more details about the unspecified fields: "
@@ -497,9 +521,20 @@ class DialogueManager:
                 default_lines.append(f"  Units: {units_entry.value} (canonical storage, system default)")
 
         # Overall Dimensions
-        default_lines.append("  Overall building footprint: width and length pending layout generation")
-        default_lines.append("  Wall thickness: 0.2 m (system default)")
-        default_lines.append("  Floor height: 3.0 m (system default)")
+        if state.overall_dimensions and (
+            state.overall_dimensions.width_m is not None
+            or state.overall_dimensions.length_m is not None
+        ):
+            w_str = f"{state.overall_dimensions.width_m} m" if state.overall_dimensions.width_m is not None else "pending"
+            l_str = f"{state.overall_dimensions.length_m} m" if state.overall_dimensions.length_m is not None else "pending"
+            user_lines.append(f"  Overall building footprint: {w_str} × {l_str}")
+        else:
+            default_lines.append("  Overall building footprint: width and length pending layout generation")
+
+        wall_th = state.overall_dimensions.wall_thickness_m if state.overall_dimensions and state.overall_dimensions.wall_thickness_m is not None else 0.2
+        floor_h = state.overall_dimensions.floor_height_m if state.overall_dimensions and state.overall_dimensions.floor_height_m is not None else 3.0
+        default_lines.append(f"  Wall thickness: {wall_th} m (system default)")
+        default_lines.append(f"  Floor height: {floor_h} m (system default)")
 
         # --- Rooms ---
         for room in state.rooms:
@@ -511,9 +546,15 @@ class DialogueManager:
             if room.width_m is not None and room.length_m is not None:
                 w_src = state.get_room_field_source(r_id, "width_m")
                 l_src = state.get_room_field_source(r_id, "length_m")
-                if w_src == FieldSource.SYSTEM_DEFAULT or l_src == FieldSource.SYSTEM_DEFAULT:
+                if w_src == FieldSource.SYSTEM_DEFAULT and l_src == FieldSource.SYSTEM_DEFAULT:
                     details.append(f"{room.width_m} m × {room.length_m} m (defaulted)")
                     default_lines.append(f"  {r_id} dimensions: {room.width_m} m × {room.length_m} m (prototype default)")
+                elif w_src == FieldSource.SYSTEM_DEFAULT:
+                    details.append(f"width: {room.width_m} m (defaulted), length: {room.length_m} m")
+                    default_lines.append(f"  {r_id} width: {room.width_m} m (prototype default)")
+                elif l_src == FieldSource.SYSTEM_DEFAULT:
+                    details.append(f"width: {room.width_m} m, length: {room.length_m} m (defaulted)")
+                    default_lines.append(f"  {r_id} length: {room.length_m} m (prototype default)")
                 else:
                     details.append(f"{room.width_m} m × {room.length_m} m")
             elif room.width_m is not None:

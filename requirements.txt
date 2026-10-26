@@ -4,7 +4,9 @@
 #
 # Pinned to tested versions. Update and re-test before changing major versions.
 
-# --- Core LLM SDK ---
+# --- Core LLM SDK (Gemini provider) ---
+# Required only for the Gemini provider.  The LM Studio provider uses
+# Python's built-in urllib and requires no extra packages.
 google-genai>=1.0.0
 
 # --- Data validation ---

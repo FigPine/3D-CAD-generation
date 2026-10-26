@@ -43,6 +43,7 @@ SCHEMA (all fields optional — use null when not mentioned):
   "floor_count": integer >= 1 | null,
   "rooms": [
     {
+      "room_id": string | null,
       "room_type": string,
       "count": integer >= 1,
       "window_count": integer >= 0 | null,
@@ -75,18 +76,21 @@ SCHEMA (all fields optional — use null when not mentioned):
 
 RULES:
 1. Use null for any field the user did not explicitly state.
-2. Do not infer dimensions or counts unless the user stated them. Do not perform arithmetic or unit conversion; output values and units as stated.
+2. Do not infer dimensions or counts unless the user stated them. Never infer overall_dimensions (width_m, length_m) from individual room dimensions. Leave overall_dimensions width_m and length_m as null unless the user explicitly specified the overall building footprint dimensions.
 3. Add a note to "ambiguities" for any value or room reference that was unclear or could refer to multiple rooms.
 4. For relationships, extract explicit connections, adjacencies, and shared walls:
-   - "connects_to": rooms connected by a doorway, passage, or direct access.
+   - "connects_to": physical doorways, passages, or direct walking access between rooms.
    - "adjacent_to": rooms positioned beside or next to each other.
-   - "shares_wall_with": rooms sharing a physical wall.
-   Do not treat connectivity, adjacency, and shared walls as interchangeable.
+   - "shares_wall_with": rooms sharing a physical wall partition.
+   Do not treat connectivity, adjacency, and shared walls as interchangeable. Adjacency or a shared wall must NOT automatically imply a connection; never add "connects_to" unless the user explicitly stated a doorway or direct connection. Preserve different relationship types between the same pair of rooms when both are stated.
    If the user states a negative constraint (e.g. "bedroom 1 must not connect to bathroom"), set "negative" to true and also record it in "constraints".
 5. The "constraints" field is for explicit must/must-not statements.
 6. The "preferences" field is for aesthetic or non-blocking wishes.
 7. Output ONLY valid JSON. Do not include markdown code fences, explanation,
    or any text outside the JSON object.
+8. When rooms have canonical identifiers (e.g. 'bedroom_1', 'bedroom_2', 'bathroom_1', 'hall_1'), preserve or output them in 'room_id'.
+9. Ensure relationships use canonical room identifiers (e.g. 'bedroom_2', 'hall_1') when identifiable.
+10. Distinguish room inventory declarations from references to existing rooms. Mentions of rooms in relationship or constraint statements must NOT create new rooms. Never create new room instances beyond the established room inventory.
 """
 
 # ---------------------------------------------------------------------------
@@ -124,14 +128,12 @@ def build_followup_prompt(
     """
     Build the user-turn content for a targeted follow-up interpretation.
 
-    Send only the fields that are still pending — not the full conversation.
-
     Parameters
     ----------
     user_reply : str
         The user's latest reply.
     pending_fields : List[str]
-        Field names that are still missing or ambiguous.
+        Field names or descriptions that are still missing or ambiguous.
     current_values : dict, optional
         A compact dict of currently-known values for context.
 
@@ -142,21 +144,22 @@ def build_followup_prompt(
     """
     context_lines: List[str] = []
     if current_values:
-        context_lines.append("Currently known values (do not change these):")
+        context_lines.append("CURRENTLY ESTABLISHED REQUIREMENTS (for reference and canonical room IDs):")
         for k, v in current_values.items():
             context_lines.append(f"  {k}: {v}")
         context_lines.append("")
 
-    fields_str = ", ".join(pending_fields) if pending_fields else "unknown"
-
+    fields_str = ", ".join(pending_fields) if pending_fields else "any unspecified details"
     context_block = "\n".join(context_lines) if context_lines else ""
 
     return (
         f"{context_block}"
-        f"The user provided the following clarification reply:\n"
         f"USER REPLY: {user_reply}\n\n"
-        f"Extract ONLY values for these fields from the reply: {fields_str}.\n"
-        "For any of these fields not addressed in the reply, use null.\n"
-        "Return ONLY a JSON object conforming to the schema. "
-        "Do not include fields that were not mentioned in the reply."
+        f"PENDING / REQUESTED DETAILS: {fields_str}.\n\n"
+        "INSTRUCTIONS:\n"
+        "1. Extract ONLY the newly specified, clarified, or modified requirements from the USER REPLY.\n"
+        "2. For room dimensions, window counts, and door counts, reference the existing canonical 'room_id' (e.g. 'bedroom_1', 'bedroom_2') from currently known requirements whenever possible.\n"
+        "3. For relationships (adjacent_to, shares_wall_with, connects_to), reference canonical room IDs for 'room_a' and 'room_b'.\n"
+        "4. For any fields that the user did NOT mention or modify in this reply, output null (established values are preserved automatically by the system).\n"
+        "5. Output ONLY a valid JSON object matching the CandidateRequirements schema without extra commentary."
     )

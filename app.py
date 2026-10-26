@@ -8,19 +8,24 @@ Usage
     python app.py
 
 The CLI starts an interactive session:
-  1. Accepts the initial building description.
-  2. Displays clarification questions (up to 3 rounds).
-  3. Shows the final requirements summary for confirmation.
-  4. On confirmation, saves the validated JSON and exits.
+  1. Provider selection (Gemini API or LM Studio local model).
+  2. Accepts the initial building description.
+  3. Displays clarification questions (up to 3 rounds).
+  4. Shows the final requirements summary for confirmation.
+  5. On confirmation, saves the validated JSON and exits.
 
 Environment
 -----------
-Set ``GEMINI_API_KEY`` before running:
+For Gemini:
+    Set ``GEMINI_API_KEY`` before running:
     Windows PowerShell: $env:GEMINI_API_KEY = "your-key"
     Linux/macOS:        export GEMINI_API_KEY="your-key"
+    Or copy .env.example to .env and fill in the key.
 
-Or copy .env.example to .env and fill in the key; the CLI will load it
-automatically using python-dotenv if installed.
+For LM Studio:
+    Optionally set ``LM_STUDIO_BASE_URL`` (default: http://localhost:1234/v1)
+    and ``LM_STUDIO_TIMEOUT`` (default: 60).
+    No API key required.
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
-    pass  # python-dotenv not installed; rely on environment variable
+    pass  # python-dotenv not installed; rely on environment variables
 
 # ---------------------------------------------------------------------------
 # Ensure the project root is on sys.path so relative imports work when the
@@ -47,11 +52,12 @@ if _PROJECT_ROOT not in sys.path:
 
 from schemas import SessionStatus
 from agents.req_ext_agent import (
+    set_llm_client,
     start_session,
     process_user_reply,
     get_session_state,
 )
-from llm.gemini_client import LLMAuthError
+from llm.base_client import LLMAuthError
 
 
 # ---------------------------------------------------------------------------
@@ -64,10 +70,6 @@ def _print_banner() -> None:
     print("  AI-Assisted 3D Building Model Generator")
     print("  Requirements Extraction Agent — v1.0")
     print("=" * 60)
-    print(
-        "Describe your building and I will extract the requirements.\n"
-        "Type 'quit' or 'exit' at any prompt to stop.\n"
-    )
 
 
 def _user_input(prompt: str) -> str:
@@ -104,22 +106,27 @@ def _display_turn(turn) -> None:
 def main() -> None:
     _print_banner()
 
-    # --- Check for API key early ---
-    if not os.environ.get("GEMINI_API_KEY"):
-        print(
-            "❌  GEMINI_API_KEY is not set.\n"
-            "    Set it in your environment or create a .env file.\n"
-            "    See .env.example for instructions."
-        )
-        sys.exit(1)
+    # --- Provider selection ---
+    # This must happen before any LLM call.  The factory handles its own
+    # availability check and exits with a clear error message on failure.
+    from llm.provider_factory import select_provider_interactive
+    client = select_provider_interactive()
 
-    # --- Initial prompt ---
-    initial_prompt = _user_input("Describe your building: ")
+    # Register the chosen client with the agent orchestrator
+    set_llm_client(client)
+
+    print("\n" + "-" * 60)
+    print("Describe your building and I will extract the requirements.")
+    print("Type 'quit' or 'exit' at any prompt to stop.")
+    print("-" * 60)
+
+    # --- Initial building description prompt ---
+    initial_prompt = _user_input("\nDescribe your building: ")
     if not initial_prompt:
         print("No input provided. Goodbye.")
         sys.exit(0)
 
-    print("\n⏳  Extracting requirements (calling Gemini)…")
+    print(f"\n⏳  Extracting requirements ({client.provider_label})…")
     try:
         turn = start_session(initial_prompt)
     except LLMAuthError as exc:
@@ -149,7 +156,7 @@ def main() -> None:
             print("Empty response — please provide an answer.")
             continue
 
-        print("\n⏳  Processing…")
+        print(f"\n⏳  Processing ({client.provider_label})…")
         turn = process_user_reply(session_id, reply)
         _display_turn(turn)
 

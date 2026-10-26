@@ -92,10 +92,13 @@ class RequirementsValidator:
         # ----- 3. Relationships -----
         self._validate_relationships(state, errors)
 
-        # ----- 4. Constraints (basic check) -----
-        # Constraints are free-form strings; no deep validation in v1.
+        # ----- 4. Constraints consistency -----
+        self._validate_constraints(state, errors)
 
-        # ----- 5. No unresolved conflicts -----
+        # ----- 5. Provenance integrity -----
+        self._validate_provenance(state, errors)
+
+        # ----- 6. No unresolved conflicts -----
         if state.conflicts:
             for c in state.conflicts:
                 errors.append(f"Unresolved conflict: {c}")
@@ -245,10 +248,12 @@ class RequirementsValidator:
         self, state: RequirementState, errors: List[str]
     ) -> None:
         valid_room_ids = {r.room_id.lower() for r in state.rooms if r.room_id}
+        seen_keys: set[tuple] = set()
 
         for rel in state.relationships:
             a = rel.room_a.lower()
             b = rel.room_b.lower()
+            is_neg = getattr(rel, "negative", False)
 
             # Self-relationship
             if a == b:
@@ -265,4 +270,59 @@ class RequirementsValidator:
             if b not in valid_room_ids:
                 errors.append(
                     f"Relationship references room ID '{rel.room_b}' which does not exist in the room list."
+                )
+
+            # Deduplication key based on endpoints, type, and negative status
+            key = (min(a, b), max(a, b), rel.relationship, is_neg)
+            opp_key = (min(a, b), max(a, b), rel.relationship, not is_neg)
+            if key in seen_keys:
+                errors.append(
+                    f"Duplicate relationship found: '{rel.room_a}' {rel.relationship.value} '{rel.room_b}'."
+                )
+            else:
+                seen_keys.add(key)
+
+            if opp_key in seen_keys:
+                errors.append(
+                    f"Contradictory relationship: '{rel.room_a}' {rel.relationship.value} '{rel.room_b}' "
+                    "is asserted as both positive and negative."
+                )
+
+    def _validate_constraints(
+        self, state: RequirementState, errors: List[str]
+    ) -> None:
+        """Validate consistency between natural-language constraints and structured relationships."""
+        from requirements.requirement_state import _extract_relationships_from_text
+        for c in state.constraints:
+            rels_in_c = _extract_relationships_from_text(c, state)
+            for rc in rels_in_c:
+                pair_c = (min(rc.room_a.lower(), rc.room_b.lower()), max(rc.room_a.lower(), rc.room_b.lower()))
+                is_neg_c = getattr(rc, "negative", False)
+                for r_state in state.relationships:
+                    pair_s = (min(r_state.room_a.lower(), r_state.room_b.lower()), max(r_state.room_a.lower(), r_state.room_b.lower()))
+                    if pair_c == pair_s and rc.relationship == r_state.relationship:
+                        is_neg_s = getattr(r_state, "negative", False)
+                        if is_neg_c != is_neg_s:
+                            errors.append(
+                                f"Constraint '{c}' contradicts structured relationship: "
+                                f"'{r_state.room_a}' {r_state.relationship.value} '{r_state.room_b}'."
+                            )
+
+    def _validate_provenance(
+        self, state: RequirementState, errors: List[str]
+    ) -> None:
+        """Ensure provenance references valid entities and consistent sources."""
+        valid_room_ids = {r.room_id for r in state.rooms if r.room_id}
+        for room_id in state.room_field_sources:
+            if room_id not in valid_room_ids:
+                errors.append(
+                    f"Provenance references unknown room ID '{room_id}'."
+                )
+        if getattr(state, "has_user_explicit_footprint", False) is False:
+            if state.overall_dimensions and (
+                state.overall_dimensions.width_m is not None
+                or state.overall_dimensions.length_m is not None
+            ):
+                errors.append(
+                    "Overall building footprint dimensions are populated but user did not explicitly provide them."
                 )
